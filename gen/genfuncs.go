@@ -2,12 +2,18 @@ package gen
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"go/types"
 	"io"
 	"os"
+	"reflect"
 	"sort"
+	"strconv"
 
 	"github.com/thepudds/fzgen/fuzzer"
 	"github.com/thepudds/fzgen/gen/internal/mod"
@@ -44,6 +50,7 @@ func emitIndependentWrappers(pkgPath string, pkgFuncs *pkg, wrapperPkgName strin
 	var w io.Writer = buf
 	emit := func(format string, args ...interface{}) {
 		fmt.Fprintf(w, format, args...)
+		//fmt.Fprintf(os.Stdout, format, args)
 	}
 
 	// emit the intro material
@@ -55,6 +62,7 @@ func emitIndependentWrappers(pkgPath string, pkgFuncs *pkg, wrapperPkgName strin
 		emit("\t\"%s\"\n", pkgPath)
 	}
 	emit("\t\"github.com/thepudds/fzgen/fuzzer\"\n")
+	emit("\t\"fuzz github.com/AdaLogics/go-fuzz-headers\"\n")
 	emit(")\n\n")
 
 	// put our functions we want to wrap into a deterministic order
@@ -106,6 +114,42 @@ type paramRepr struct {
 	paramName string
 	typ       string
 	v         *types.Var
+}
+
+// just for fun let's try it out
+func SomeFunction(data interface{}) ([]byte, error) {
+	someFunctionInner(reflect.ValueOf(data))
+	return json.Marshal(data)
+}
+
+func someFunctionInner(v reflect.Value) {
+	if v.Kind() == reflect.Pointer {
+		v = v.Elem()
+	}
+
+	for i := 0; i < v.NumField(); i++ {
+		vField := v.Field(i)
+
+		switch vField.Kind() {
+		case reflect.Slice:
+			if vField.IsNil() {
+				vField.Set(reflect.MakeSlice(vField.Type(), 0, 0))
+			} else {
+				for j := 0; j < vField.Len(); j++ {
+					vFieldInner := vField.Index(j)
+					if vFieldInner.Kind() != reflect.Struct &&
+						(vFieldInner.Kind() != reflect.Pointer || vFieldInner.Elem().Kind() != reflect.Struct) {
+						continue
+					}
+
+					someFunctionInner(vFieldInner.Index(j))
+				}
+			}
+		case reflect.Pointer, reflect.Struct:
+			someFunctionInner(vField)
+		default:
+		}
+	}
 }
 
 // emitIndependentWrapper emits one fuzzing wrapper if possible.
@@ -194,10 +238,19 @@ func emitIndependentWrapper(emit emitFunc, function mod.Func, constructors []mod
 	// which we can't fill with values during fuzzing.
 
 	support, unsupportedParam := checkParamSupport(inputParams)
+
 	if support == noSupport {
-		// skip this wrapper.
-		emit("// skipping %s because parameters include func, chan, or unsupported interface: %v\n\n", wrapperName, unsupportedParam)
-		return fmt.Errorf("%w: %s takes %s", errUnsupportedParams, function.FuncName, unsupportedParam)
+		//fmt.Printf("%v", unsupportedParam[len(unsupportedParam)-1:])
+		if unsupportedParam[len(unsupportedParam)-1:] == "i" {
+			// skip this wrapper.
+			//struct fuzz target template
+			unsupportedParam = unsupportedParam[:len(unsupportedParam)-2]
+			emitInterfaceWrapper(emit, localPkg)
+			//emit("// skipping %s because parameters include func, chan, or unsupported interface: %v\n\n", wrapperName, unsupportedParam)
+			return fmt.Errorf("%w: %s takes %s", errUnsupportedParams, function.FuncName, unsupportedParam)
+		}
+
+		//if unsupportedParam[len(unsupportedParam)-1:] == "c" {
 	}
 
 	// Start emitting the wrapper function!
@@ -303,6 +356,130 @@ func emitIndependentWrapper(emit emitFunc, function mod.Func, constructors []mod
 	emit("}\n\n")
 
 	return nil
+}
+
+func emitInterfaceWrapper(emit emitFunc, localPkg *types.Package) {
+	pkgs := localPkg.Path()
+	for _, file := range pkgs.Syntax {
+		fset := token.NewFileSet()
+		filename := fset.File(file.Pos()).Name()
+		node, err := parser.ParseFile(fset, filename, nil, parser.ParseComments)
+		if err != nil {
+			os.Exit(255)
+		}
+
+		// traverse all tokens
+		ast.Inspect(node, func(n ast.Node) bool {
+			switch t := n.(type) {
+			// find variable declarations
+			case *ast.TypeSpec:
+				// which are public
+				if t.Name.IsExported() {
+					switch t.Type.(type) {
+					// and are interfaces
+					case *ast.InterfaceType:
+						var method_name_list []string
+						var params_type_list [][]ast.Expr
+						var results_type_list [][]ast.Expr
+						var i int = 0
+						iface := t.Type.(*ast.InterfaceType)
+						iface_pointer := iface.Methods.List
+						for _, v := range iface_pointer {
+							slice_pointer := (*v).Names
+							method_name := *&slice_pointer[0].Name
+							method_name_list = append(method_name_list, method_name)
+							params_type_list = append(params_type_list, []ast.Expr{})
+							results_type_list = append(results_type_list, []ast.Expr{})
+							//fmt.Print(method_name)
+							func_v := v.Type.(*ast.FuncType)
+							params_pointer := func_v.Params.List
+							for _, p := range params_pointer {
+								params_type := (*&p).Type
+								params_type_list[i] = append(params_type_list[i], params_type)
+								//fmt.Print("(", params_type, ") ")
+							}
+							results_pointer := func_v.Results.List
+							for _, r := range results_pointer {
+								results_type := (*&r).Type
+								results_type_list[i] = append(results_type_list[i], results_type)
+								//fmt.Println(results_type)
+							}
+							i++
+						}
+
+						emit("type ToBeGeneratedFuzzInstance struct {")
+						var generated_name_list [][]string
+						for i := 0; i < len(method_name_list); i++ {
+							for j := 0; j < len(results_type_list[i]); j++ {
+								generated_name_list = append(generated_name_list, []string{})
+								generated_name_list[i] = append(generated_name_list[i], method_name_list[i]+strconv.Itoa(i)+strconv.Itoa(j))
+								emit("\t%s %s", generated_name_list[i][j], results_type_list[i][j])
+							}
+						}
+						emit("}")
+						emit("")
+
+						for i := 0; i < len(method_name_list); i++ {
+							emit("func (i ToBeGeneratedFuzzInstance) %s(", method_name_list[i])
+							for j := 0; j < len(params_type_list[i]); j++ {
+								if j == len(params_type_list[i])-1 {
+									emit("%s)", params_type_list[i][j])
+								} else {
+									emit("%s, ", params_type_list[i][j])
+								}
+							}
+							if len(results_type_list[i]) == 1 {
+								emit(" %s", results_type_list[i][0])
+							} else {
+								emit(" (")
+								for j := 0; j < len(results_type_list[i]); j++ {
+									if j == len(params_type_list[i])-1 {
+										emit("%s)", results_type_list[i][j])
+									} else {
+										emit("%s, ", results_type_list[i][j])
+									}
+								}
+							}
+							emit(" { return i.")
+							for j := 0; j < len(generated_name_list[i]); j++ {
+								if j == len(generated_name_list[i])-1 {
+									emit("%s}", generated_name_list[i][j])
+								} else {
+									emit("%s i.", generated_name_list[i][j])
+								}
+							}
+						}
+						emit("")
+
+						emit("func ToBeGeneratedToBeFuzzed(")
+						for i := 0; i < len(generated_name_list); i++ {
+							for j := 0; j < len(results_type_list[i]); j++ {
+								if i == len(generated_name_list)-1 {
+									emit("pseudo%s", generated_name_list[i][j])
+									emit(" %s", results_type_list[i][j])
+								} else {
+									emit("pseudo%s", generated_name_list[i][j])
+									emit(" %s, ", results_type_list[i][j])
+								}
+							}
+						}
+						emit(") {")
+						emit("\tToFuzz(")
+						emit("\t\tToBeGeneratedFuzzInstance{")
+						for i := 0; i < len(generated_name_list); i++ {
+							for j := 0; j < len(generated_name_list[i]); j++ {
+								emit("\t\t%s: pseudo%s,", generated_name_list[i][j], generated_name_list[i][j])
+							}
+						}
+						emit("\t\t},")
+						emit("\t)")
+						emit("}")
+					}
+				}
+			}
+			return true
+		})
+	}
 }
 
 // emitNilChecks emits checks for nil for our input parameters.
@@ -450,11 +627,13 @@ func checkParamSupport(allWrapperParams []*types.Var) (paramSupport, string) {
 		switch t.Underlying().(type) {
 		case *types.Interface:
 			if !fuzzer.SupportedInterfaces[t.String()] {
-				return noSupport, v.Type().String()
+				return noSupport, v.Type().String() + " i"
 			}
 			res = min(fillRequired, res)
-		case *types.Signature, *types.Chan:
-			return noSupport, v.Type().String()
+		case *types.Signature:
+			return noSupport, v.Type().String() + " s"
+		case *types.Chan:
+			return noSupport, v.Type().String() + " c"
 		}
 
 		// If we didn't easily find a problematic type above, we'll guess that cmd/go supports it,

@@ -2,14 +2,14 @@
 // for the fzgen command.
 //
 // See the project README for additional information:
-//     https://github.com/thepudds/fzgen
+//
+//	https://github.com/thepudds/fzgen
 package gen
 
 import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -226,7 +226,7 @@ func FzgenMain() int {
 		}
 
 		// Write the output.
-		err = ioutil.WriteFile(outFile, adjusted, 0o644)
+		err = os.WriteFile(outFile, adjusted, 0o644)
 		if err != nil {
 			fail(err)
 		}
